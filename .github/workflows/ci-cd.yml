@@ -1,0 +1,212 @@
+name: CI/CD
+
+# Code change -> push -> security scans + unit tests -> build -> S3 -> deploy to EC2 -> verify production
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deployments at once; a newer push waits for the running one to finish.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ---------------------------------------------------------------- DevSecOps
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency scan (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Fail on high/critical vulnerabilities
+        run: npm audit --audit-level=high
+
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
+
+  # ---------------------------------------------------------------- CI
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Run Jest (pipeline stops here if any test fails)
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  build:
+    name: Build artifact
+    needs: [unit-tests, secret-scan, dependency-scan, sast]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact: ${{ steps.meta.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Compute version
+        id: meta
+        run: |
+          BASE=$(node -p "require('./package.json').version.split('.').slice(0,2).join('.')")
+          VERSION="${BASE}.${GITHUB_RUN_NUMBER}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "artifact=build-v${VERSION}.zip" >> "$GITHUB_OUTPUT"
+      - name: Install production dependencies only
+        run: npm ci --omit=dev
+      - name: Stamp build info
+        run: |
+          cat > build-info.json <<JSON
+          {"version":"${{ steps.meta.outputs.version }}","commit":"${GITHUB_SHA::7}","builtAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+          JSON
+          cat build-info.json
+      - name: Package
+        run: |
+          mkdir -p dist
+          zip -qr "dist/${{ steps.meta.outputs.artifact }}" src node_modules package.json package-lock.json build-info.json
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-build
+          path: dist/${{ steps.meta.outputs.artifact }}
+          retention-days: 7
+
+  # ---------------------------------------------------------------- CD (main only)
+  publish-s3:
+    name: Upload build to S3
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC -> AWS, no static access keys
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-build
+          path: dist
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Upload artifact and mark it as the latest successful build
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+          ARTIFACT: ${{ needs.build.outputs.artifact }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          aws s3 cp "dist/${ARTIFACT}" "s3://${BUCKET}/releases/${ARTIFACT}"
+          aws s3 cp scripts/deploy.sh "s3://${BUCKET}/deploy/deploy.sh"
+          # latest.json is written only after the zip upload succeeds, so it always points at a complete build
+          printf '{"version":"%s","key":"releases/%s","commit":"%s"}\n' "$VERSION" "$ARTIFACT" "${GITHUB_SHA::7}" > latest.json
+          aws s3 cp latest.json "s3://${BUCKET}/releases/latest.json" --content-type application/json
+          echo "### Uploaded s3://${BUCKET}/releases/${ARTIFACT}" >> "$GITHUB_STEP_SUMMARY"
+          aws s3 ls "s3://${BUCKET}/releases/"
+
+  deploy:
+    name: Deploy latest build to EC2
+    needs: [build, publish-s3]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Pull latest build from S3 onto the server (SSM Run Command)
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy v${VERSION}" \
+            --parameters "commands=[\"aws s3 cp s3://${BUCKET}/deploy/deploy.sh /tmp/deploy.sh --region ${AWS_REGION}\",\"bash /tmp/deploy.sh ${BUCKET} ${AWS_REGION}\"]" \
+            --query Command.CommandId --output text)
+          echo "SSM command: $CMD_ID"
+          for i in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            echo "status: $STATUS"
+            case "$STATUS" in Pending|InProgress|Delayed) continue ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent,StandardErrorContent]' --output text
+          [ "$STATUS" = "Success" ] || { echo "::error::Deployment failed with status $STATUS"; exit 1; }
+
+  verify:
+    name: Verify production
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke test the live application
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          for i in $(seq 1 10); do
+            BODY=$(curl -fsS "${APP_URL}/health" || true)
+            echo "$BODY"
+            if echo "$BODY" | grep -q "\"version\":\"${VERSION}\""; then
+              echo "### Production is serving v${VERSION} at ${APP_URL}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Production is not serving v${VERSION}"
+          exit 1
