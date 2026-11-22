@@ -44,15 +44,15 @@ gh repo create cicd-pipeline-demo --public --source . --push
 
 # 2. Provision AWS (S3 bucket, EC2, IAM roles, OIDC provider). Takes about 3 minutes.
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-aws cloudformation deploy --stack-name cicd-demo --template-file infra/stack.yml \
-  --capabilities CAPABILITY_IAM --region us-east-1 \
-  --parameter-overrides GitHubRepo=$REPO CreateOidcProvider=true
-#    (use CreateOidcProvider=false if your account already has the GitHub OIDC provider)
+aws cloudformation deploy --stack-name devops-assignment --template-file infra/stack.yml \
+  --capabilities CAPABILITY_IAM --region ap-southeast-2 \
+  --parameter-overrides GitHubRepo=$REPO CreateOidcProvider=false
+#    (use CreateOidcProvider=true if the account does not have the GitHub OIDC provider yet)
 
 # 3. Wire the stack outputs into GitHub repo variables
-out() { aws cloudformation describe-stacks --stack-name cicd-demo --region us-east-1 \
+out() { aws cloudformation describe-stacks --stack-name devops-assignment --region ap-southeast-2 \
           --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-gh variable set AWS_REGION      --body us-east-1
+gh variable set AWS_REGION      --body ap-southeast-2
 gh variable set AWS_ROLE_ARN    --body "$(out DeployRoleArn)"
 gh variable set S3_BUCKET       --body "$(out ArtifactBucketName)"
 gh variable set EC2_INSTANCE_ID --body "$(out InstanceId)"
@@ -91,5 +91,5 @@ To show the "tests gate the deploy" behaviour, change an expected value in `test
 
 ```bash
 aws s3 rm s3://$(out ArtifactBucketName) --recursive   # versioned bucket: also empty old versions in the console
-aws cloudformation delete-stack --stack-name cicd-demo --region us-east-1
+aws cloudformation delete-stack --stack-name devops-assignment --region ap-southeast-2
 ```
