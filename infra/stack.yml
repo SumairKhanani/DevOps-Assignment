@@ -5,6 +5,12 @@ Parameters:
   GitHubRepo:
     Type: String
     Description: owner/repo allowed to assume the deploy role (e.g. octocat/cicd-pipeline-demo)
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Immutable OIDC subject prefix if the repo uses one, e.g. repo:owner@123/repo@456
+      (see: gh api repos/OWNER/REPO/actions/oidc/customization/sub)
   CreateOidcProvider:
     Type: String
     AllowedValues: ['true', 'false']
@@ -22,6 +28,7 @@ Parameters:
 
 Conditions:
   MakeOidc: !Equals [!Ref CreateOidcProvider, 'true']
+  HasSubjectPrefix: !Not [!Equals [!Ref GitHubSubjectPrefix, '']]
 
 Resources:
   ArtifactBucket:
@@ -141,6 +148,8 @@ Resources:
                 token.actions.githubusercontent.com:sub:
                   - !Sub 'repo:${GitHubRepo}:ref:refs/heads/main'
                   - !Sub 'repo:${GitHubRepo}:environment:production'
+                  - !If [HasSubjectPrefix, !Sub '${GitHubSubjectPrefix}:ref:refs/heads/main', !Ref AWS::NoValue]
+                  - !If [HasSubjectPrefix, !Sub '${GitHubSubjectPrefix}:environment:production', !Ref AWS::NoValue]
       Policies:
         - PolicyName: ci-deploy
           PolicyDocument:

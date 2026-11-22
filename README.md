@@ -46,7 +46,8 @@ gh repo create cicd-pipeline-demo --public --source . --push
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 aws cloudformation deploy --stack-name devops-assignment --template-file infra/stack.yml \
   --capabilities CAPABILITY_IAM --region ap-southeast-2 \
-  --parameter-overrides GitHubRepo=$REPO CreateOidcProvider=false
+  --parameter-overrides GitHubRepo=$REPO CreateOidcProvider=false \
+      GitHubSubjectPrefix=$(gh api repos/$REPO/actions/oidc/customization/sub --jq '.sub_claim_prefix // ""')
 #    (use CreateOidcProvider=true if the account does not have the GitHub OIDC provider yet)
 
 # 3. Wire the stack outputs into GitHub repo variables
